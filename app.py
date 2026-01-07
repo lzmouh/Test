@@ -65,55 +65,55 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- EXCEL PROCESSING LOGIC ---
+# --- UPDATED EXCEL PROCESSING LOGIC ---
 def import_excel_data(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. Clear Demo/Existing Data (except Admin)
-    cursor.execute("DELETE FROM properties")
-    cursor.execute("DELETE FROM transactions")
-    cursor.execute("DELETE FROM users WHERE role != 'admin'")
+    # ... (Clear existing data logic) ...
 
-    # 2. Process Master Sheet
+    # 1. Process Master Sheet
     master_df = pd.read_excel(xls, 'Master')
     for _, row in master_df.iterrows():
-        # Insert Property
+        # CONVERT TIMESTAMP TO STRING
+        lease_end_str = ""
+        if pd.notna(row['Lease end']):
+            # This handles the 'Timestamp' not supported error
+            lease_end_str = pd.to_datetime(row['Lease end']).strftime('%Y-%m-%d')
+
         cursor.execute("INSERT OR REPLACE INTO properties VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (str(row['Flat']), row['Building'], row['Owner'], row['Tenant'], 
-                        row['Rent'], row['EWA limit'], row['Lease end']))
+                        row['Rent'], row['EWA limit'], lease_end_str))
         
-        # Create Owner User
-        owner_user = f"owner_{str(row['Owner']).lower().replace(' ', '')}"
-        pw = hashlib.sha256("password123".encode()).hexdigest()
-        cursor.execute("INSERT OR IGNORE INTO users (username, password, role, linked_id) VALUES (?, ?, ?, ?)",
-                       (owner_user, pw, 'owner', row['Owner']))
-        
-        # Create Tenant User
-        if pd.notna(row['Tenant']):
-            tenant_user = f"tenant_{str(row['Flat']).lower()}"
-            cursor.execute("INSERT OR IGNORE INTO users (username, password, role, linked_id) VALUES (?, ?, ?, ?)",
-                           (tenant_user, pw, 'tenant', str(row['Flat'])))
+        # ... (User creation logic) ...
 
-    # 3. Process Individual Flat Sheets
+    # 2. Process Individual Flat Sheets
     for sheet_name in xls.sheet_names:
         if sheet_name == 'Master': continue
         
-        # Read sheet, skipping header rows based on your file structure
         df = pd.read_excel(xls, sheet_name, skiprows=2) 
-        # Clean columns to match DB
+        
         for _, row in df.iterrows():
             if pd.isna(row['Month']): continue
+            
+            # CONVERT MONTH TIMESTAMP TO STRING
+            month_str = pd.to_datetime(row['Month']).strftime('%Y-%m-%d')
+            
+            # Use .get() or check for NaN to ensure numeric values
             cursor.execute('''INSERT INTO transactions (flat_id, month, rent_paid, ewa_cost, chiller, other_fees, comments)
                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                           (sheet_name, str(row['Month']), row.get('Rent', 0), row.get('EWA', 0), 
-                            row.get('Chiller', 0), row.get('Other fees', 0), row.get('Comments', '')))
+                           (sheet_name, month_str, 
+                            float(row.get('Rent', 0)) if pd.notna(row.get('Rent')) else 0,
+                            float(row.get('EWA', 0)) if pd.notna(row.get('EWA')) else 0, 
+                            float(row.get('Chiller', 0)) if pd.notna(row.get('Chiller')) else 0, 
+                            float(row.get('Other fees', 0)) if pd.notna(row.get('Other fees')) else 0, 
+                            str(row.get('Comments', '')) if pd.notna(row.get('Comments')) else ''))
 
     conn.commit()
     conn.close()
     return True
-
+    
 # --- UI COMPONENTS ---
 def login():
     st.sidebar.title("Login")

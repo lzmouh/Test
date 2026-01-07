@@ -7,9 +7,16 @@ import plotly.graph_objects as go
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-# --- CONFIGURATION ---
-DB_NAME = "real_estate_advanced.db"
+import streamlit as st
+import pandas as pd
+import sqlite3
+import hashlib
+from datetime import datetime
 
+# --- CONFIGURATION ---
+DB_NAME = "real_estate_mgmt.db"
+
+# --- DATABASE ENGINE ---
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -18,18 +25,118 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Tables (Users, Properties, Transactions)
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT, linked_id TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS properties (flat_id TEXT PRIMARY KEY, building TEXT, owner_name TEXT, tenant_name TEXT, rent REAL, ewa_limit REAL, lease_end TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY, flat_id TEXT, month TEXT, rent_paid REAL, ewa_cost REAL, chiller REAL, other_fees REAL, comments TEXT)''')
     
-    # Default Admin
+    # Create Tables
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE,
+                        password TEXT,
+                        role TEXT,
+                        linked_id TEXT)''')
+    
+    cursor.execute('''CREATE TABLE IF NOT EXISTS properties (
+                        flat_id TEXT PRIMARY KEY,
+                        building TEXT,
+                        owner_name TEXT,
+                        tenant_name TEXT,
+                        rent REAL,
+                        ewa_limit REAL,
+                        lease_end TEXT)''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS transactions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        flat_id TEXT,
+                        month TEXT,
+                        rent_paid REAL,
+                        ewa_cost REAL,
+                        chiller REAL,
+                        other_fees REAL,
+                        comments TEXT,
+                        FOREIGN KEY(flat_id) REFERENCES properties(flat_id))''')
+    
+    # Create Default Admin if not exists
     cursor.execute("SELECT * FROM users WHERE username='admin'")
     if not cursor.fetchone():
-        pw = hashlib.sha256("admin123".encode()).hexdigest()
-        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ('admin', pw, 'admin'))
+        admin_pw = hashlib.sha256("admin123".encode()).hexdigest()
+        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", 
+                       ('admin', admin_pw, 'admin'))
+        
+        # Insert Demo Data
+        cursor.execute("INSERT OR IGNORE INTO properties VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       ('DEMO101', 'Demo Tower', 'Owner_John', 'Tenant_Alice', 500.0, 20.0, '2025-12-31'))
+        
     conn.commit()
     conn.close()
+
+# --- ROBUST EXCEL IMPORTER (ETL) ---
+def import_excel_data(uploaded_file):
+    xls = pd.ExcelFile(uploaded_file)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Clear non-admin data
+    cursor.execute("DELETE FROM properties")
+    cursor.execute("DELETE FROM transactions")
+    cursor.execute("DELETE FROM users WHERE role != 'admin'")
+
+    # 1. Process Master Sheet
+    master_df = pd.read_excel(xls, 'Master')
+    for _, row in master_df.iterrows():
+        flat_id = str(row['Flat'])
+        owner = str(row['Owner'])
+        tenant = str(row['Tenant']) if pd.notna(row['Tenant']) else "Vacant"
+        
+        # Date Cleaning
+        lease_end_dt = pd.to_datetime(row.get('Lease end'), errors='coerce')
+        lease_end_str = lease_end_dt.strftime('%Y-%m-%d') if pd.notna(lease_end_dt) else ""
+
+        cursor.execute("INSERT OR REPLACE INTO properties VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (flat_id, row['Building'], owner, tenant, 
+                        row['Rent'], row['EWA limit'], lease_end_str))
+        
+        # Create Users
+        default_pw = hashlib.sha256("password123".encode()).hexdigest()
+        
+        # Owner User
+        owner_uname = f"owner_{owner.lower().replace(' ', '_')}"
+        cursor.execute("INSERT OR IGNORE INTO users (username, password, role, linked_id) VALUES (?, ?, ?, ?)",
+                       (owner_uname, default_pw, 'owner', owner))
+        
+        # Tenant User (Linked to Flat ID)
+        if tenant != "Vacant":
+            tenant_uname = f"tenant_{flat_id.lower()}"
+            cursor.execute("INSERT OR IGNORE INTO users (username, password, role, linked_id) VALUES (?, ?, ?, ?)",
+                           (tenant_uname, default_pw, 'tenant', flat_id))
+
+    # 2. Process Individual Flat Sheets
+    for sheet_name in xls.sheet_names:
+        if sheet_name == 'Master': continue
+        
+        # skiprows=2 handles the metadata rows in your specific files
+        df = pd.read_excel(xls, sheet_name, skiprows=2) 
+        
+        for _, row in df.iterrows():
+            # ROBUST DATE PARSING: Handles "Balance:" strings by coercing to NaT
+            month_dt = pd.to_datetime(row.get('Month'), errors='coerce')
+            if pd.isna(month_dt): 
+                continue # Skips "Balance:" rows and header duplicates
+                
+            month_str = month_dt.strftime('%Y-%m-%d')
+
+            def clean_val(val):
+                return float(val) if pd.notna(val) and isinstance(val, (int, float)) else 0.0
+
+            cursor.execute('''INSERT INTO transactions (flat_id, month, rent_paid, ewa_cost, chiller, other_fees, comments)
+                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                           (str(sheet_name), month_str, 
+                            clean_val(row.get('Rent')), clean_val(row.get('EWA')), 
+                            clean_val(row.get('Chiller')), clean_val(row.get('Other fees')), 
+                            str(row.get('Comments', ''))))
+
+    conn.commit()
+    conn.close()
+    return True
+
 
 # --- ANALYTICS HELPERS ---
 def get_trimmed_data(df):

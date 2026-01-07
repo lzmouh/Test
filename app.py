@@ -71,43 +71,55 @@ def import_excel_data(uploaded_file):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # ... (Clear existing data logic) ...
+    # 1. Clear existing data (but keep Admin)
+    cursor.execute("DELETE FROM properties")
+    cursor.execute("DELETE FROM transactions")
+    cursor.execute("DELETE FROM users WHERE role != 'admin'")
 
-    # 1. Process Master Sheet
+    # 2. Process Master Sheet
     master_df = pd.read_excel(xls, 'Master')
     for _, row in master_df.iterrows():
-        # CONVERT TIMESTAMP TO STRING
-        lease_end_str = ""
-        if pd.notna(row['Lease end']):
-            # This handles the 'Timestamp' not supported error
-            lease_end_str = pd.to_datetime(row['Lease end']).strftime('%Y-%m-%d')
+        # Clean Lease End Date
+        lease_end_raw = pd.to_datetime(row.get('Lease end'), errors='coerce')
+        lease_end_str = lease_end_raw.strftime('%Y-%m-%d') if pd.notna(lease_end_raw) else None
 
         cursor.execute("INSERT OR REPLACE INTO properties VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (str(row['Flat']), row['Building'], row['Owner'], row['Tenant'], 
                         row['Rent'], row['EWA limit'], lease_end_str))
         
-        # ... (User creation logic) ...
+        # User generation... (same as before)
 
-    # 2. Process Individual Flat Sheets
+    # 3. Process Individual Flat Sheets
     for sheet_name in xls.sheet_names:
         if sheet_name == 'Master': continue
         
+        # skiprows=2 handles the Flat # and Tenant # rows
         df = pd.read_excel(xls, sheet_name, skiprows=2) 
         
         for _, row in df.iterrows():
-            if pd.isna(row['Month']): continue
+            # KEY FIX: Coerce errors. If it's "Balance:", it becomes NaT (Not a Time)
+            month_dt = pd.to_datetime(row.get('Month'), errors='coerce')
             
-            # CONVERT MONTH TIMESTAMP TO STRING
-            month_str = pd.to_datetime(row['Month']).strftime('%Y-%m-%d')
+            # Only proceed if month_dt is a valid date object
+            if pd.isna(month_dt):
+                continue
+                
+            month_str = month_dt.strftime('%Y-%m-%d')
             
-            # Use .get() or check for NaN to ensure numeric values
+            # Helper to handle Excel NaNs in numeric columns
+            def to_float(val):
+                try:
+                    return float(val) if pd.notna(val) else 0.0
+                except:
+                    return 0.0
+
             cursor.execute('''INSERT INTO transactions (flat_id, month, rent_paid, ewa_cost, chiller, other_fees, comments)
                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
                            (sheet_name, month_str, 
-                            float(row.get('Rent', 0)) if pd.notna(row.get('Rent')) else 0,
-                            float(row.get('EWA', 0)) if pd.notna(row.get('EWA')) else 0, 
-                            float(row.get('Chiller', 0)) if pd.notna(row.get('Chiller')) else 0, 
-                            float(row.get('Other fees', 0)) if pd.notna(row.get('Other fees')) else 0, 
+                            to_float(row.get('Rent')),
+                            to_float(row.get('EWA')), 
+                            to_float(row.get('Chiller')), 
+                            to_float(row.get('Other fees')), 
                             str(row.get('Comments', '')) if pd.notna(row.get('Comments')) else ''))
 
     conn.commit()
